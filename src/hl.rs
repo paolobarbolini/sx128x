@@ -133,6 +133,19 @@ impl<
     }
 
     pub async fn send(&mut self, buf: &[u8]) -> Result<(), E> {
+        // Put the radio into a known state before setting up TX. If a
+        // previous receive() was cancelled, the radio could still be in RX
+        // mode and receiving packets, which would keep setting IRQ bits
+        // under the old RX mask while we reconfigure for TX.
+        self.set_standbyrc().await?;
+
+        // Clear any IRQ flags left over from the previous operation.
+        // This lowers DIO1 so the subsequent wait_for_high() is reliable.
+        self.ll
+            .clr_irq_status()
+            .dispatch_async(|cmd| cmd.set_value(Irq::all().bits()))
+            .await?;
+
         self.set_buffer_base_address().await?;
 
         self.params.packet_params.payload_length = buf.len() as u8;
@@ -177,6 +190,15 @@ impl<
         &mut self,
         buf: &mut [u8],
     ) -> Result<Option<(usize, LoRaPacketStatus)>, E> {
+        // Handle stale IRQ state from a previously cancelled receive().
+        // The IRQ register and data buffer are independent on the SX1280:
+        // ClearIrqStatus only touches the flag bits, not the buffer contents.
+        // So if RxDone is set, the packet data is still intact in the buffer.
+        let stale_irqs = self.ll.get_irq_status().dispatch_async().await?;
+        if stale_irqs.value() != 0 {
+            return self.read_rx_buffer_and_clear(stale_irqs.value(), buf).await;
+        }
+
         self.set_buffer_base_address().await?;
 
         // TODO mechanism to deal with Irq::PreambleDetected.
@@ -207,10 +229,22 @@ impl<
         let irqs = self.ll.get_irq_status().dispatch_async().await?;
         debug!("IRQS {}", irqs);
 
-        let irqs_value = Irq::from_bits_retain(irqs.value());
-        let rx_done = irqs_value.contains(Irq::RxDone);
-        let crc_error = irqs_value.contains(Irq::CrcError);
-        let result = match (rx_done, crc_error) {
+        self.read_rx_buffer_and_clear(irqs.value(), buf).await
+    }
+
+    /// Inspect the given IRQ flags, read out a pending packet (if any), and
+    /// clear the flags.
+    ///
+    /// Returns `Some` only if RxDone is set without CrcError. A CRC-errored
+    /// packet is dropped with a warning; all other cases return `None`.
+    async fn read_rx_buffer_and_clear(
+        &mut self,
+        irqs_raw: u16,
+        buf: &mut [u8],
+    ) -> Result<Option<(usize, LoRaPacketStatus)>, E> {
+        let irqs = Irq::from_bits_retain(irqs_raw);
+
+        let result = match (irqs.contains(Irq::RxDone), irqs.contains(Irq::CrcError)) {
             (true, false) => {
                 let packet_status = self.ll.get_packet_status().dispatch_async().await?;
                 let rx_buffer_status = self.ll.get_rx_buffer_status().dispatch_async().await?;
@@ -232,9 +266,7 @@ impl<
 
         self.ll
             .clr_irq_status()
-            .dispatch_async(|cmd| {
-                cmd.set_value(irqs.value());
-            })
+            .dispatch_async(|cmd| cmd.set_value(irqs_raw))
             .await?;
 
         Ok(result)
