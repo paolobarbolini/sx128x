@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 device-driver = "1.0"
+embassy-futures = "0.1.1"
+embassy-time = "0.5"
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 
@@ -15,7 +17,6 @@ log = { version = "0.4", optional = true }
 bitflags = "2.9"
 
 [dev-dependencies]
-embassy-futures = "0.1.1"
 embedded-hal-mock = { version = "0.11", features = ["embedded-hal-async"] }
 
 [features]

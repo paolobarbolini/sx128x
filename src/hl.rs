@@ -1,5 +1,8 @@
 use core::convert::Infallible;
 
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer};
+
 use crate::{
     hl::lora::LoRaPacketStatus,
     ll::{self, PacketType},
@@ -252,7 +255,6 @@ impl<
 
         self.set_buffer_base_address().await?;
 
-        // TODO mechanism to deal with Irq::PreambleDetected.
         // TODO mechanism to deal with Irq::HeaderError.
         let irq = Irq::RxDone | Irq::RxTxTimeout | Irq::HeaderError | Irq::CrcError;
 
@@ -281,6 +283,114 @@ impl<
         debug!("IRQS {}", irqs);
 
         self.read_rx_buffer_and_clear(irqs.value(), buf).await
+    }
+
+    /// Listen for a packet, but bail out early if no preamble is detected
+    /// within `probe`.
+    ///
+    /// Enables the PreambleDetected IRQ alongside the normal RxDone family,
+    /// so we can know within a few ms whether anything is on the air. If the
+    /// probe window passes with no activity, returns `Ok(None)` immediately;
+    /// the cancel-safe machinery in [`receive`] / `receive_with_preamble_probe`
+    /// will pick up any packet that lands in the buffer afterwards.
+    ///
+    /// If a preamble is detected, the function then waits up to `rx` for the
+    /// full RxDone (or terminal error). This combination lets the caller
+    /// poll RX cheaply (small `probe`) without truncating in-flight packets.
+    pub async fn receive_with_preamble_probe(
+        &mut self,
+        buf: &mut [u8],
+        probe: Duration,
+        rx: Duration,
+    ) -> Result<Option<(usize, LoRaPacketStatus)>, E> {
+        // Stale-IRQ handling, same as receive().
+        let stale_irqs = self.ll.get_irq_status().dispatch_async().await?;
+        if stale_irqs.value() != 0 {
+            return self.read_rx_buffer_and_clear(stale_irqs.value(), buf).await;
+        }
+
+        self.set_buffer_base_address().await?;
+
+        let irq = Irq::RxDone
+            | Irq::RxTxTimeout
+            | Irq::HeaderError
+            | Irq::CrcError
+            | Irq::PreambleDetected;
+
+        self.ll
+            .set_dio_irq_params()
+            .dispatch_async(|cmd| {
+                cmd.set_irq_mask(irq.bits());
+                cmd.set_dio_1_mask(irq.bits());
+            })
+            .await?;
+
+        self.params.packet_params.payload_length = buf.len() as u8;
+        self.set_packet_params(self.params.packet_params).await?;
+
+        self.ll
+            .set_rx()
+            .dispatch_async(|cmd| {
+                cmd.set_period_base(ll::RxTimeoutStep::Step15Us625);
+                cmd.set_period_base_count(ll::RxTimeoutBaseCount::SingleMode);
+            })
+            .await?;
+
+        // Probe: wait for any IRQ or the probe timeout, whichever comes first.
+        if matches!(
+            select(self.dio1.wait_for_high(), Timer::after(probe)).await,
+            Either::Second(_)
+        ) {
+            // Probe window expired with no activity. Cancel-safe handling
+            // on the next receive call will recover any packet that lands
+            // in the buffer between now and then.
+            return Ok(None);
+        }
+
+        let irqs = self.ll.get_irq_status().dispatch_async().await?;
+        let irqs_flags = Irq::from_bits_retain(irqs.value());
+
+        // Already-terminal IRQs: hand off to the standard reader.
+        if irqs_flags.intersects(Irq::RxDone | Irq::CrcError | Irq::HeaderError | Irq::RxTxTimeout)
+        {
+            return self.read_rx_buffer_and_clear(irqs.value(), buf).await;
+        }
+
+        if irqs_flags.contains(Irq::PreambleDetected) {
+            // Clear the preamble flag so DIO1 drops back low and the next
+            // wait_for_high() can fire on RxDone.
+            self.ll
+                .clr_irq_status()
+                .dispatch_async(|cmd| cmd.set_value(Irq::PreambleDetected.bits()))
+                .await?;
+
+            // Wait for the actual reception to complete.
+            if matches!(
+                select(self.dio1.wait_for_high(), Timer::after(rx)).await,
+                Either::Second(_)
+            ) {
+                // Preamble seen but reception didn't complete in time.
+                // Clear whatever is pending so the next call starts clean.
+                let cleanup = self.ll.get_irq_status().dispatch_async().await?;
+                if cleanup.value() != 0 {
+                    self.ll
+                        .clr_irq_status()
+                        .dispatch_async(|cmd| cmd.set_value(cleanup.value()))
+                        .await?;
+                }
+                return Ok(None);
+            }
+
+            let irqs = self.ll.get_irq_status().dispatch_async().await?;
+            return self.read_rx_buffer_and_clear(irqs.value(), buf).await;
+        }
+
+        // Some unexpected IRQ -- clear and bail.
+        self.ll
+            .clr_irq_status()
+            .dispatch_async(|cmd| cmd.set_value(irqs.value()))
+            .await?;
+        Ok(None)
     }
 
     /// Inspect the given IRQ flags, read out a pending packet (if any), and
