@@ -185,6 +185,57 @@ impl<
             .await
     }
 
+    /// Perform Channel Activity Detection (CAD).
+    ///
+    /// Listens to the channel for `symbols` LoRa symbols and reports whether
+    /// LoRa activity was detected. Useful as a "listen before talk" primitive
+    /// before calling [`send`] to avoid transmitting over an in-progress
+    /// packet.
+    ///
+    /// Returns `true` if activity was detected on the channel, `false` if
+    /// the channel appears clear.
+    pub async fn cad(&mut self, symbols: ll::LoraCadSymbols) -> Result<bool, E> {
+        // Put the radio into a known state.
+        self.set_standbyrc().await?;
+
+        // Clear any stale IRQ flags so DIO1 is low going into CAD.
+        self.ll
+            .clr_irq_status()
+            .dispatch_async(|cmd| cmd.set_value(Irq::all().bits()))
+            .await?;
+
+        self.ll
+            .set_cad_params()
+            .dispatch_async(|cmd| cmd.set_value(symbols))
+            .await?;
+
+        let irq = Irq::CadDone | Irq::CadActivityDetected;
+        self.ll
+            .set_dio_irq_params()
+            .dispatch_async(|cmd| {
+                cmd.set_irq_mask(irq.bits());
+                cmd.set_dio_1_mask(irq.bits());
+                cmd.set_dio_2_mask(Irq::empty().bits());
+                cmd.set_dio_3_mask(Irq::empty().bits());
+            })
+            .await?;
+
+        self.ll.set_cad().dispatch_async().await?;
+
+        let _ = self.dio1.wait_for_high().await;
+
+        let irqs = self.ll.get_irq_status().dispatch_async().await?;
+        debug!("CAD IRQS {}", irqs);
+
+        self.ll
+            .clr_irq_status()
+            .dispatch_async(|cmd| cmd.set_value(irqs.value()))
+            .await?;
+
+        let flags = Irq::from_bits_retain(irqs.value());
+        Ok(flags.contains(Irq::CadActivityDetected))
+    }
+
     // TODO packet status
     pub async fn receive(
         &mut self,
